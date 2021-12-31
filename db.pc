@@ -1,0 +1,348 @@
+
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <oraca.h>
+#include <sqlcpr.h>
+#include <sqlda.h>
+#include <sqlca.h>
+
+//#include "defines.h"				// CJN
+#define CDR_INSERT_BLOCK_SIZE 1000	// CJN
+//#define CDR_INSERT_BLOCK_SIZE 1
+
+
+#ifndef ORA_PROC
+#include "db.h"
+#include "db_data_containers.h"
+#include "cdr.h"
+#include <fstream>
+#endif
+
+extern decoded_cdr *gsm_cdr_block;
+extern bool debug;
+extern int array_insert_size;
+extern int global_cdr_counter;
+
+
+
+#define BUF_LEN 	100
+#define FETCH_SIZE	1000
+#define BUF_LENTH	20		
+
+
+EXEC SQL DECLARE CDR DATABASE; 
+EXEC SQL DECLARE RATING DATABASE;
+
+
+EXEC SQL BEGIN DECLARE SECTION;
+	char *login;
+EXEC SQL END DECLARE SECTION;
+
+
+void sql_error(char *msg)
+{
+	cout << endl << msg << endl;
+	sqlca.sqlerrm.sqlerrmc[sqlca.sqlerrm.sqlerrml] = '\0';
+	oraca.orastxt.orastxtc[oraca.orastxt.orastxtl] = '\0';
+	oraca.orasfnm.orasfnmc[oraca.orasfnm.orasfnml] = '\0';
+	cout << sqlca.sqlerrm.sqlerrmc << endl;
+	cout << "in " << oraca.orastxt.orastxtc << endl;
+	cout << "on line " << oraca.oraslnr << " of " << oraca.orasfnm.orasfnmc
+		<< endl << endl;
+	
+	//-- Roll back any pending changes and disconnect from Oracle.
+	EXEC SQL ROLLBACK RELEASE;
+	exit(1);
+}
+
+
+//-- Connect to ORACLE. 
+void db_connect(char *in_login)
+{
+	login = in_login;  // a pointer assignment, in_login has the space acclocation
+
+    EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error--");
+
+	//cout<<"\nConnecting to ORACLE  as: "<<login<<endl;
+	cout<<"\nConnecting to ORACLE  "<<endl;
+ 
+    EXEC SQL CONNECT :login;
+	EXEC SQL ALTER SESSION SET NLS_DATE_FORMAT="DD/MM/YYYY HH24:MI:SS"; 
+	cout<<"Connected  to Database"<<endl<<endl; 
+
+}
+
+
+
+
+
+void db_disconnect()
+{
+	cout<<"\nORACLE  database: DISCONNECT"<<endl;
+	EXEC SQL COMMIT WORK RELEASE; 
+}	
+
+
+
+
+// get cdr files
+void cdr_files::db_read()
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		char file_name[BUF_LEN];			// varchar2(123)
+		int file_id;					// called id_no in table number(9)
+	} a[FETCH_SIZE]; 
+	int rows_to_fetch, rows_before, rows_this_time; 
+
+	EXEC SQL END DECLARE SECTION;
+
+	int i;
+
+	rows_to_fetch = FETCH_SIZE;		// number of rows in each "batch"  
+	rows_before = 0;				// previous value of sqlerrd[2]   
+	rows_this_time = FETCH_SIZE;
+	 
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error:");
+
+    EXEC SQL DECLARE c_cdr_file CURSOR FOR 
+
+	SELECT	FILE_NAME,  CDR_FILE_ID_NO
+	FROM	sys_interconnect_dump_files
+	WHERE DECODED_DATE IS NULL;
+       
+    EXEC SQL OPEN c_cdr_file; 
+	EXEC SQL WHENEVER NOT FOUND CONTINUE;
+	EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error:"); 
+
+	while (rows_this_time == rows_to_fetch) 
+	{ 
+		EXEC SQL FETCH c_cdr_file INTO :a; 		 
+		rows_this_time = sqlca.sqlerrd[2] - rows_before; 
+		rows_before = sqlca.sqlerrd[2]; 
+		//printf(" this=%d before=%d to_fetch=%d\n", rows_this_time, rows_before, rows_to_fetch);
+
+
+		cdr_file_statistics cd;
+		cd.init();
+		for(i=0; i<rows_this_time; i++)
+		{
+			cd.file_id = a[i].file_id;			
+			insert(a[i].file_name, cd);
+		}
+	} 
+
+    EXEC SQL CLOSE c_cdr_file; 
+ 
+    printf("\n %d  cdr files loaded.\n\n",rows_before);
+}
+
+
+
+void cdr_files::db_update(cdr_file_statistics s)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+	struct cdr_file_t
+	{ 
+		 int valid_cdr_count;					//  number(7)
+		 int error_count;						//	number(7)
+		 int bytes_read;						//	number(9)
+		 char first_cdr_date[BUF_LENTH];				//	varchar2(14)
+		 char last_cdr_date[BUF_LENTH];				//	varchar2(14)
+		 int rating_duration;
+		 char rating_start_date[BUF_LENTH];	//	varchar2(14)
+
+		 int id_no;						//	number(9)
+ 	} a; 
+
+	EXEC SQL END DECLARE SECTION;
+
+
+//#ifndef code_skip
+
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+	 a.id_no = s.file_id;
+	 cout << "a.id_no :" <<a.id_no<<endl;
+	 cout <<"s.file_id : "<<s.file_id<<endl;
+
+	 a.valid_cdr_count = s.valid_cdr_count;
+	 a.error_count = s.error_count;
+	 a.bytes_read = s.bytes_read;
+	 strcpy(a.first_cdr_date, s.first_cdr_date.c_str());
+	 strcpy(a.last_cdr_date, s.last_cdr_date.c_str());
+	 a.rating_duration = s.rating_duration;
+	 strcpy(a.rating_start_date, s.rating_start_date.c_str());
+	 
+	 	
+//#endif
+
+	 EXEC SQL WHENEVER SQLERROR DO sql_error("ORACLE error:");
+	 EXEC SQL	
+	 UPDATE sys_interconnect_dump_files
+	 SET 
+		valid_cdr_count			= :a.valid_cdr_count, 
+		error_count				= :a.error_count,
+		bytes_read				= :a.bytes_read,
+		first_cdr_date			= to_date(:a.first_cdr_date,'YYYYMMDDHH24MISS'),
+		last_cdr_date			= to_date(:a.last_cdr_date,'YYYYMMDDHH24MISS'),
+		decoded_date			= SYSDATE
+	 WHERE cdr_file_id_no  = :a.id_no;
+
+	 EXEC SQL COMMIT;
+ 
+    printf("\n cdr file id=%d log updated.\n\n", s.file_id);
+
+}		
+
+
+
+
+
+
+void db_insert_decoded_cdr(int cdr_count)
+{
+	EXEC SQL BEGIN DECLARE SECTION;
+
+	static struct db_cdr
+	{	
+		int		file_id;								//  number(9)
+		int		file_pos;								//	number(9)
+		int		type_of_msc;							//	number(3),
+		int		type_of_call;							//  number(3),
+		int		call_termination_type;					//  number(3),
+		int		origin_of_call_indicator;				//  number(3),
+		char	circuit_allocation_time_stamp[BUF_LEN];	//	date,		// call_time in db
+		int		call_duration;							//	number(9),
+		char	end_of_call_time_stamp[BUF_LEN];		//	varchar2(10),
+		char	msc_identity[BUF_LEN];					//	varchar2(20),
+		int		called_party_number_noai;				//	number(3),
+		char	called_party_number[BUF_LEN];			//	varchar2(40),
+		int		calling_party_number_noai;				//	number(3),
+		char	calling_party_number[BUF_LEN];			//	varchar2(40),
+		char	outgoing_trunk_group[BUF_LEN];			//	varchar2(10),
+		char	incoming_trunk_group[BUF_LEN];			//	varchar2(10)
+		int		service_type_id;						//  number(3)	// 50 - hard code
+		char	calling_network[BUF_LEN];				//	varchar2(5)	// null
+		char	called_network[BUF_LEN];				//	varchar2(5)	// null
+		char	day_type_id[BUF_LEN];					//	varchar2(5)	// null
+		char	mediated_time[BUF_LEN];				//	date			- sysdate
+	} * a;
+
+	char	med_system_date[20];  
+
+	int rows_to_insert;
+	
+	EXEC SQL END DECLARE SECTION;
+	
+	rows_to_insert = cdr_count;
+	
+	if((a = new db_cdr[array_insert_size])==NULL)
+	{
+		cout<<" cant allocate memory for cdr insert"<<endl;
+		exit(0);
+	}
+	
+	
+	for(int j=0; j<array_insert_size; j++)
+	{
+		a[j].file_pos = 0;
+	}
+	
+	for(int i=0; i<rows_to_insert; i++)
+	{
+		a[i].file_id			= gsm_cdr_block[i].file_id; 
+		a[i].file_pos		= gsm_cdr_block[i].file_pos;
+		a[i].type_of_msc		= gsm_cdr_block[i].type_of_msc;
+		a[i].type_of_call	= gsm_cdr_block[i].type_of_call;
+		a[i].call_termination_type	= gsm_cdr_block[i].call_termination_type;
+		a[i].origin_of_call_indicator= gsm_cdr_block[i].origin_of_call_indicator;
+		
+		reng_date d=gsm_cdr_block[i].d_circuit_allocation_date;
+		reng_time t=gsm_cdr_block[i].d_circuit_allocation_time;
+		char buf[100];
+		sprintf(buf,"%02d%s%02d%s%04d%s%02d%s%02d%s%02d",d.day,"/",d.month,"/",d.year," ",t.hour,":",t.min,":",t.second); 
+		strcpy(a[i].circuit_allocation_time_stamp, buf);	
+
+		a[i].call_duration	= gsm_cdr_block[i].call_duration;
+		strcpy(a[i].end_of_call_time_stamp, gsm_cdr_block[i].end_of_call_time_stamp.substr(0,10) .c_str());
+		strncpy(a[i].msc_identity, gsm_cdr_block[i].msc_identity.substr(0,20) .c_str(),20);
+		a[i].called_party_number_noai = gsm_cdr_block[i].called_party_number_noai;
+		strncpy(a[i].called_party_number, gsm_cdr_block[i].called_party_number.substr(0,40) .c_str(),40);
+		a[i].calling_party_number_noai = gsm_cdr_block[i].calling_party_number_noai;
+		strncpy(a[i].calling_party_number, gsm_cdr_block[i].calling_party_number.substr(0,40) .c_str(),40);
+
+		strncpy(a[i].outgoing_trunk_group, gsm_cdr_block[i].outgoing_trunk_group.substr(0,10) .c_str(),10);
+		strncpy(a[i].incoming_trunk_group, gsm_cdr_block[i].incoming_trunk_group.substr(0,10) .c_str(),10);
+
+		a[i].service_type_id = 50;
+		strcpy(a[i].calling_network, "");
+		strcpy(a[i].called_network, "");	
+		strcpy(a[i].day_type_id, "");
+		
+		if ( debug )
+		{					
+			cout <<"file_id						:" << a[i].file_id 					<< endl;
+			cout <<"file_pos					:" << a[i].file_pos 				<< endl;
+			cout <<"type_of_msc					:" << a[i].type_of_msc 				<< endl;
+			cout <<"type_of_call				:"<< a[i].type_of_call				<< endl;
+			cout <<"call_termination_type		:" << a[i].call_termination_type	<< endl;
+			cout <<"origin_of_call_indicator	:" << a[i].origin_of_call_indicator	<< endl;
+			cout <<"circuit_allocation_time_stamp	:" << a[i].circuit_allocation_time_stamp	<<	endl;
+			cout <<"call_duration				:" << a[i].call_duration			<< endl;
+			cout <<"end_of_call_time_stamp		:" << a[i].end_of_call_time_stamp	<< endl;
+			cout <<"msc_identity				:" << a[i].msc_identity				<< endl;
+			cout <<"called_party_number_noai	:" << a[i].called_party_number_noai	<< endl;
+			cout <<"called_party_number			:" << a[i].called_party_number		<< endl;
+			cout <<"calling_party_number_noai	:" << a[i].calling_party_number_noai<< endl;
+			cout <<"calling_party_number		:" << a[i].calling_party_number		<< endl;
+			cout <<"outgoing_trunk_group		:" << a[i].outgoing_trunk_group		<< endl;
+			cout <<"incoming_trunk_group		:" << a[i].incoming_trunk_group		<< endl;
+			cout <<"service_type_id				:" << a[i].service_type_id			<< endl;
+			cout <<"calling_network				:" << a[i].calling_network 			<< endl;
+			cout <<"called_network				:" << a[i].called_network			<< endl;
+			cout <<"day_type_id					:" << a[i].day_type_id				<< endl;
+		}
+	}
+
+	EXEC SQL
+	select sysdate into :med_system_date from dual;
+	
+	for(int k=0; k<array_insert_size; k++)
+	{
+		strcpy(a[k].mediated_time, med_system_date);
+	}  
+
+	EXEC SQL  FOR :rows_to_insert  INSERT INTO DYN_5_UDR 
+	(
+		file_id,
+		file_pos,
+		type_of_msc,
+		type_of_call,
+		call_termination_type,
+		origin_of_call_indicator,
+		circuit_allocation_time_stamp,
+		call_duration,
+		end_of_call_time_stamp,
+		msc_identity,
+		called_party_number_noai,
+		called_party_number,
+		calling_party_number_noai,
+		calling_party_number,
+		outgoing_trunk_group,
+		incoming_trunk_group,
+		service_type_id,
+		calling_network,
+		called_network,
+		day_type_id,
+		mediated_time
+	) 
+	VALUES (:a);
+	
+	EXEC SQL COMMIT;
+	delete a;
+}
+
